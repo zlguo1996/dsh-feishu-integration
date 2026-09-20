@@ -2,167 +2,223 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  extractLayers,
+  describeReply,
   buildNotificationCard,
   cardFitsBudget,
+  parseBlocks,
   CARD_BYTE_BUDGET,
   DEFAULT_MAX_DETAIL_CHARS,
+  HEADER_COMPOSE_BELOW,
 } from '../lib/shared/progressive.js'
 
-/** 卡片里是否含折叠面板。 */
 const panel = (card) => card.elements.find((e) => e.tag === 'collapsible_panel')
 const markdowns = (card) => card.elements.filter((e) => e.tag === 'markdown').map((e) => e.content)
 
-// ── L0 结论行：优先级与清洗 ──────────────────────────────────────────────
+// ── 不变量 1：绝不改写正文 ────────────────────────────────────────────────
+// 这组用例全部来自真实语料里被旧实现改坏的样本。旧实现用 marker / 序号正则
+// 「清洗」标题，实际是在改写作者原文。
 
-test('显式「结论：」标记优先于更早出现的标题', () => {
-  const text = ['## 打包：3114176 → success ✅', '', '结论：本次打包成功，二维码已更新。', '', '- 详情 A'].join('\n')
-  assert.equal(extractLayers(text).headline, '本次打包成功，二维码已更新。')
+test('不改写多级编号标题（旧实现把 "1.1" 吃成 "1"）', () => {
+  const text = '## 1.1 一个比喻先立起来：数字人 = 一家私人助理事务所\n\n后续说明。'
+  assert.equal(describeReply(text).header, '1.1 一个比喻先立起来：数字人 = 一家私人助理事务所')
 })
 
-test('没有标记时取首个标题，并去掉 # 与行内装饰', () => {
-  const text = ['## 打包结果 ✅', '', '- 二维码已更新'].join('\n')
-  assert.equal(extractLayers(text).headline, '打包结果 ✅')
+test('不把「摘要」当标记而截掉标题前半段（旧实现改坏过）', () => {
+  const text = '## 摘要已交付：/tmp/s76_摘要.md\n\n说明文字。'
+  assert.equal(describeReply(text).header, '摘要已交付：/tmp/s76_摘要.md')
 })
 
-test('剥掉中文序号章节前缀（真实载荷 turn 1 的失败形态）', () => {
-  const text = [
-    '### 一、朱烨今天发你的消息（POPO，`zhuye05@corp.netease.com`）',
-    '',
-    '- `:60:41` property `guideStyle` not found',
-  ].join('\n')
-  assert.equal(extractLayers(text).headline, '朱烨今天发你的消息（POPO，zhuye05@corp.netease.com）')
+test('不动「结论：」这类前缀，刻意去掉它也属于改写（旧实现会去掉）', () => {
+  const text = '## 结论：不允许。但它有两道闸，两道都会漏\n\n说明。'
+  assert.equal(describeReply(text).header, '结论：不允许。但它有两道闸，两道都会漏')
 })
 
-test('跳过叙述型开场（真实载荷 turn 27 的失败形态：英文 meta 残留）', () => {
-  const text = [
-    "Goal marked complete. Now let me write the final report answering the user's questions.",
-    '',
-    '分支已包含最新主干，落后 0 个提交。',
-  ].join('\n')
-  assert.equal(extractLayers(text).headline, '分支已包含最新主干，落后 0 个提交。')
+test('保留中文序号前缀「一、」——剥掉它属于改写原文', () => {
+  // 标题足够长：原样保留
+  assert.equal(
+    describeReply('## 一、验收结果与相关背景说明\n\n后面还有正文。').header,
+    '一、验收结果与相关背景说明',
+  )
+  // 标题过短触发组合时，序号同样保留（组合只做追加，不做删除）
+  assert.ok(describeReply('## 一、验收结果\n\n后面还有正文。').header.startsWith('一、验收结果'))
 })
 
-test('纯填充语不算结论，继续往下找', () => {
-  const text = ['已完成', '', '本轮把出站通知改成卡片折叠。'].join('\n')
-  assert.equal(extractLayers(text).headline, '本轮把出站通知改成卡片折叠。')
-})
+// ── 不变量 2：只说结构，不猜语义 ──────────────────────────────────────────
 
-test('代码围栏内的 # 标题与列表不参与抽取', () => {
-  const text = ['```', '# not a heading', '- not a bullet', '```', '', '真实结论在这里。'].join('\n')
-  const layers = extractLayers(text)
-  assert.equal(layers.headline, '真实结论在这里。')
+test('代码围栏内的 # 与 - 不是结构', () => {
+  const text = ['```', '# not a heading', '- not a list', '```', '', '真实段落。'].join('\n')
+  const layers = describeReply(text)
+  assert.equal(layers.header, '真实段落。')
   assert.deepEqual(layers.bullets, [])
 })
 
-test('引用块不参与抽取', () => {
-  const text = ['> 引用：这不是结论', '', '真结论。'].join('\n')
-  assert.equal(extractLayers(text).headline, '真结论。')
+test('引用块不作为标题或要点', () => {
+  const text = ['> 引用不是结论', '', '真段落。'].join('\n')
+  assert.equal(describeReply(text).header, '真段落。')
 })
 
-test('只有代码没有正文时给出空结论而不抛错', () => {
-  const layers = extractLayers('```\nconsole.log(1)\n```')
-  assert.equal(layers.headline, '')
-  assert.deepEqual(layers.bullets, [])
+test('parseBlocks 把结构块切干净，且段落不吞掉水平线以外的结构', () => {
+  const blocks = parseBlocks(['# 标题', '', '- 一', '- 二', '', '段落。', '', '```', 'code', '```'].join('\n'))
+  assert.deepEqual(blocks.map((b) => b.type), ['heading', 'list', 'paragraph', 'code'])
 })
 
-test('空输入不抛错', () => {
-  const layers = extractLayers('')
-  assert.equal(layers.headline, '')
-  assert.deepEqual(layers.bullets, [])
-  assert.equal(layers.detail, '')
-  assert.equal(layers.folded, false)
-  assert.equal(layers.truncated, false)
+test('首个非空行是水平线的情况在真实语料中为 0，因此不特判（记录了该决定）', () => {
+  // 语料 2462 条中 0 条以水平线开头；加 hr 规则属于无收益的复杂化。
+  const layers = describeReply('---')
+  assert.equal(typeof layers.header, 'string')
 })
 
-test('超长标题被裁剪到 80 字以内', () => {
-  const layers = extractLayers('一、' + '很长的标题'.repeat(40))
-  assert.ok(layers.headline.length <= 80, `headline=${layers.headline.length}`)
+// ── 唯一的数值启发式：标题过短则补后文首句（T=12 来自拐点测量）────────────
+
+test('默认阈值就是 12（拐点：再往上只增长度、不降空洞）', () => {
+  assert.equal(HEADER_COMPOSE_BELOW, 12)
 })
 
-// ── L1 要点 ──────────────────────────────────────────────────────────────
+test('标题过短时与后文首句组合，避免头部只剩空洞标签', () => {
+  const text = '## 核心发现\n\n这段是 4 个 turn，全部正常收尾。补充说明。'
+  assert.equal(describeReply(text).header, '核心发现：这段是 4 个 turn，全部正常收尾。')
+  assert.equal(describeReply(text).headerSource, 'composed')
+})
 
-test('要点取第一个连续列表块，最多 5 条', () => {
-  const text = ['- 第一点内容', '- 第二点内容', '- 第三点', '- 第四点', '- 第五点', '- 第六点', '- 第七点'].join('\n')
-  const layers = extractLayers(text)
+test('标题足够长时不组合，保持原文', () => {
+  const text = '## 这是一条信息量足够的标题\n\n后面一段。'
+  const layers = describeReply(text)
+  assert.equal(layers.header, '这是一条信息量足够的标题')
+  assert.equal(layers.headerSource, 'heading')
+})
+
+test('标题过短但后面没有内容时，只有标题，不编造', () => {
+  const layers = describeReply('## 交付物')
+  assert.equal(layers.header, '交付物')
+  assert.equal(layers.headerSource, 'heading')
+})
+
+test('后面只有列表时，组合取列表首项', () => {
+  const text = '## 产出\n\n- report/verdicts/group-07.jsonl — 58 条判定\n- 另一条\n'
+  assert.equal(describeReply(text).header, '产出：report/verdicts/group-07.jsonl — 58 条判定')
+})
+
+test('composeBelow=0 可关闭组合（阈值可配、可关）', () => {
+  const text = '## 核心发现\n\n这段是 4 个 turn。'
+  assert.equal(describeReply(text, { composeBelow: 0 }).header, '核心发现')
+})
+
+test('无标题时退回首个段落的首句', () => {
+  const text = '分支已包含最新主干，落后 0 个提交。后面还有别的。'
+  const layers = describeReply(text)
+  assert.equal(layers.header, '分支已包含最新主干，落后 0 个提交。')
+  assert.equal(layers.headerSource, 'paragraph')
+})
+
+test('组合头部逐段回传 base/tail/separator（审计据此校验，不必猜拼接点）', () => {
+  // 真实语料里的形态：标题本身含全角冒号、去装饰后不足 12 字 → 触发组合。
+  // 旧审计按「首个冒号」切分，在这种输入上切错，误报为「改写了原文」。
+  const text = '## 一、权限：**结论要推翻**\n\n我上一条说「权限已加好」，这是错的。'
+  const l = describeReply(text)
+  assert.equal(l.headerSource, 'composed')
+  assert.equal(l.headerBase, '一、权限：结论要推翻')
+  assert.equal(l.headerTail, '我上一条说「权限已加好」，这是错的。')
+  assert.equal(l.header, l.headerBase + l.headerSeparator + l.headerTail)
+})
+
+test('标题本身以冒号结尾时不再重复插入分隔符', () => {
+  const l = describeReply('## 问题1：\n\n这个问题的答案是另一个。')
+  assert.equal(l.headerBase, '问题1：')
+  assert.equal(l.headerSeparator, '')
+  assert.ok(!l.header.includes('：：'))
+})
+
+test('裁剪不切开 emoji（代理对切一半会在客户端显示成替换字符）', () => {
+  const layers = describeReply('# ' + '🎯'.repeat(60) + ' 标题正文')
+  // 去掉成对代理项后不应残留孤立代理项
+  const stripped = layers.header.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
+  assert.ok(!/[\uD800-\uDFFF]/.test(stripped), '存在被切开的代理对')
+})
+
+// ── 要点：第一个列表块，没有就不编造 ────────────────────────────────────
+
+test('要点取第一个连续列表块，最多 5 条并去 Markdown 装饰', () => {
+  const text = ['# 标题足够长不需要组合', '', '- **加粗** 一条', '- `code` 二条', '- 三条', '- 四条', '- 五条', '- 六条'].join('\n')
+  const layers = describeReply(text)
   assert.equal(layers.bullets.length, 5)
-  assert.equal(layers.bullets[0], '第一点内容')
+  assert.equal(layers.bullets[0], '加粗 一条')
+  assert.equal(layers.bullets[1], 'code 二条')
 })
 
-test('没有列表就不编造要点', () => {
-  const layers = extractLayers('这是一段普通正文，没有任何列表。')
-  assert.deepEqual(layers.bullets, [])
+test('没有列表就没有要点', () => {
+  assert.deepEqual(describeReply('一段没有列表的普通正文，足够长到超过组合阈值。').bullets, [])
 })
 
 test('要点单条被裁剪到 60 字以内', () => {
-  const layers = extractLayers('- ' + 'x'.repeat(200))
-  assert.ok(layers.bullets[0].length <= 60, `len=${layers.bullets[0].length}`)
+  const layers = describeReply('# 标题\n\n- ' + 'x'.repeat(200))
+  assert.ok(layers.bullets[0].length <= 60)
 })
 
-test('要点会去掉行内 Markdown 装饰', () => {
-  const layers = extractLayers('- **加粗** 与 `code` 混排')
-  assert.equal(layers.bullets[0], '加粗 与 code 混排')
-})
-
-// ── L2 折叠与自适应 ────────────────────────────────────────────────────
+// ── 折叠与截断阈值 ──────────────────────────────────────────────────────
 
 test('短回复不折叠', () => {
-  const layers = extractLayers('好的，已完成。')
-  assert.equal(layers.folded, false)
+  assert.equal(describeReply('好的，已完成。').folded, false)
 })
 
-test('长回复折叠，且正文按 maxDetailChars 截断', () => {
-  const layers = extractLayers('x'.repeat(7000))
-  assert.equal(layers.folded, true)
-  assert.equal(layers.truncated, true)
-  assert.equal(layers.detail.length, DEFAULT_MAX_DETAIL_CHARS)
-  assert.equal(layers.detailChars, 7000)
+test('长回复折叠，超过 maxDetailChars 才截断', () => {
+  const many = describeReply('x'.repeat(7000))
+  assert.equal(many.folded, true)
+  assert.equal(many.truncated, true)
+  assert.equal(many.detail.length, DEFAULT_MAX_DETAIL_CHARS)
+  assert.equal(many.detailChars, 7000)
+
+  const mid = describeReply('y'.repeat(4000))
+  assert.equal(mid.folded, true)
+  assert.equal(mid.truncated, false)
+})
+
+test('空输入不抛错', () => {
+  const layers = describeReply('')
+  assert.equal(layers.header, '')
+  assert.deepEqual(layers.bullets, [])
+  assert.equal(layers.detail, '')
+  assert.equal(layers.folded, false)
 })
 
 // ── 卡片组装 ────────────────────────────────────────────────────────────
 
-test('长回复产出默认折叠的折叠面板', () => {
-  const layers = extractLayers(['结论：做完了。', '', '- 要点一', '', 'x'.repeat(800)].join('\n'))
+test('长回复：头部=抽取行，要点常驻，正文进默认折叠面板', () => {
+  const layers = describeReply(['## 核心发现', '', '- 要点一', '', 'x'.repeat(800)].join('\n'))
   const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 12, cwd: '/tmp/w', layers })
+  assert.equal(card.header.title.content, '核心发现：要点一')
   const p = panel(card)
   assert.ok(p, '应有 collapsible_panel')
   assert.equal(p.expanded, false)
-  assert.equal(p.header.icon_position, 'right')
   assert.equal(p.header.icon_expanded_angle, -180)
-  assert.ok(p.elements[0].content.includes('x'.repeat(50)))
-  // 折叠态才有常驻可见的结论行与要点
-  assert.equal(markdowns(card)[0], '**做完了。**')
-  assert.equal(markdowns(card)[1], '• 要点一')
+  assert.equal(markdowns(card)[0], '• 要点一')
+  assert.ok(markdowns(card).some((m) => m.includes('dsh 回复总结') && m.includes('turn 12') && m.includes('cwd: /tmp/w')))
 })
 
-test('短回复不产出折叠面板，且只展示正文（不重复一行结论）', () => {
-  const layers = extractLayers('结论：已修复。')
+test('短回复：正文直接可见，不产出折叠面板', () => {
+  const layers = describeReply('结论：已修复。')
   const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 3, layers })
   assert.equal(panel(card), undefined)
-  // 短消息本身就是一层：正文原样展示，不额外加一行加粗结论（否则同一句话显示两遍）
-  assert.deepEqual(markdowns(card), ['结论：已修复。'])
+  assert.ok(markdowns(card).some((m) => m === '结论：已修复。'))
 })
 
-test('卡片头部含标题与 turn，正文尾部带 cwd', () => {
-  const layers = extractLayers('结论：好了。')
-  const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 7, cwd: '/Users/guo/work', layers })
+test('抽取不到头部时回退到「标题 · turn」', () => {
+  const layers = describeReply('```\ncode only\n```')
+  const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 7, layers })
   assert.equal(card.header.title.content, 'dsh 回复总结 · turn 7')
-  assert.ok(markdowns(card).includes('cwd: /Users/guo/work'))
 })
 
-test('超大正文被压缩到字节预算内（卡片硬上限 30KB，安全线 24KB）', () => {
-  // 20000 个中文字 ≈ 60KB，必须靠收缩正文压回安全线
-  const layers = extractLayers('中'.repeat(20000), { maxDetailChars: 20000 })
+test('超大正文被压到字节预算内（卡片硬上限 30KB，安全线 24KB）', () => {
+  const layers = describeReply('中'.repeat(20000), { maxDetailChars: 20000 })
   const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 99, cwd: '/tmp/w', layers })
   const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8')
-  assert.ok(bytes <= CARD_BYTE_BUDGET, `card=${bytes} bytes 超过预算 ${CARD_BYTE_BUDGET}`)
+  assert.ok(bytes <= CARD_BYTE_BUDGET, `card=${bytes} 超过 ${CARD_BYTE_BUDGET}`)
   assert.equal(cardFitsBudget(card), true)
   assert.ok(panel(card).header.title.content.includes('已截断'))
 })
 
-test('预算收缩是有界的：极端输入也不会无限循环且仍留可读正文', () => {
-  const layers = extractLayers('中'.repeat(60000), { maxDetailChars: 60000 })
+test('预算收缩有界收敛：极端输入也不会死循环', () => {
+  const layers = describeReply('中'.repeat(60000), { maxDetailChars: 60000 })
   const card = buildNotificationCard({ title: 't', turn: 1, layers, byteBudget: 2000 })
-  assert.ok(Buffer.byteLength(JSON.stringify(card), 'utf8') <= 2000 * 4, '应在有限轮次内收敛')
+  assert.ok(Buffer.byteLength(JSON.stringify(card), 'utf8') <= 2000 * 4)
   assert.ok(panel(card).elements[0].content.length > 0)
 })
