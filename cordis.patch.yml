@@ -6,7 +6,11 @@
       name: dsh-feishu-integration
       config:
         title: dsh 回复总结
-        maxText: 1500
+        # card=结论行 + 要点常驻可见，正文收进折叠面板；text=旧的整段纯文本
+        notificationFormat: card
+        maxText: 1500                # 纯文本形态（含卡片失败时的回退）正文上限
+        maxDetailChars: 6000         # 折叠正文上限：折叠态不占聊天列表，可比 maxText 宽松
+        foldThresholdChars: 400      # 短于此长度不折叠，避免为短消息增加一次点击
         includeReasons: [completed]
         takeoverInbound: false
         replyTimeoutMs: 600000
