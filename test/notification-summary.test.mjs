@@ -109,19 +109,20 @@ test('coverageViolations 允许同组状态词（原文 success 支持摘要「�
 
 // ── formatter：调用 / deadline / 回退 ────────────────────────────────────
 
-function mockCtx(chunks) {
+function mockCtx(chunks, services = {}) {
   const calls = []
+  const stream = (options) => {
+    calls.push(options)
+    return (async function* () {
+      for (const c of chunks) yield c
+    })()
+  }
   return {
     calls,
     ctx: {
-      llm: {
-        stream(options) {
-          calls.push(options)
-          return (async function* () {
-            for (const c of chunks) yield c
-          })()
-        },
-      },
+      // 插件用 ctx.get('llm') 取服务（llm 不是硬依赖），mock 必须提供 get。
+      get: (name) => (name === 'llm' ? { stream } : services[name]),
+      llm: { stream },
     },
   }
 }
@@ -173,17 +174,14 @@ test('输出不可解析 / 不合契约 → 回退确定性兜底（带上原因
 })
 
 test('超过 deadline 立即回退（不等模型），且不阻塞通知', async () => {
-  const ctx = {
-    llm: {
-      stream: (options) => (async function* () {
-        // 模拟 provider 忽略 signal：永不 yield
-        await new Promise((resolve) => {
-          if (options.signal?.aborted) return resolve()
-          options.signal?.addEventListener('abort', resolve, { once: true })
-        })
-      })(),
-    },
-  }
+  const stream = (options) => (async function* () {
+    // 模拟 provider 忽略 signal：永不 yield
+    await new Promise((resolve) => {
+      if (options.signal?.aborted) return resolve()
+      options.signal?.addEventListener('abort', resolve, { once: true })
+    })
+  })()
+  const ctx = { get: (name) => (name === 'llm' ? { stream } : undefined) }
   const f = createNotificationFormatter({ ctx, config: { provider: 'p', model: 'm', timeoutMs: 200 } })
   const started = Date.now()
   const r = await f.format(REPLY)
@@ -194,9 +192,35 @@ test('超过 deadline 立即回退（不等模型），且不阻塞通知', asyn
 })
 
 test('provider 抛错 → 回退，不冒泡', async () => {
-  const ctx = { llm: { stream: () => { throw new Error('provider exploded') } } }
+  const ctx = { get: (name) => (name === 'llm' ? { stream: () => { throw new Error('provider exploded') } } : undefined) }
   const f = createNotificationFormatter({ ctx, config: { provider: 'p', model: 'm' } })
   const r = await f.format(REPLY)
   assert.equal(r.via, 'fallback')
   assert.ok(r.reason.includes('provider exploded'))
+})
+
+// ── 路由解析：零配置可用，且不写死任何 provider ─────────────────────────
+
+test('路由解析：显式配置优先于 agent 默认模型', () => {
+  const { ctx } = mockCtx([])
+  ctx.agentDefaultModel = { currentSelection: () => ({ provider: 'agent-prov', model: 'agent-model' }) }
+  const f = createNotificationFormatter({ ctx, config: { provider: 'cfg-prov', model: 'cfg-model' } })
+  assert.deepEqual(f.resolveRoute(), { provider: 'cfg-prov', model: 'cfg-model' })
+})
+
+test('路由解析：未显式配置时用 agent 默认模型', () => {
+  const { ctx } = mockCtx([])
+  ctx.agentDefaultModel = { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+  const f = createNotificationFormatter({ ctx, config: {} })
+  assert.deepEqual(f.resolveRoute(), { provider: 'deepseek-official', model: 'deepseek-flash' })
+})
+
+test('两条路由都拿不到 → 不调模型，直接确定性兜底', async () => {
+  const { ctx, calls } = mockCtx([])
+  const f = createNotificationFormatter({ ctx, config: {} })
+  assert.equal(f.resolveRoute(), null)
+  const r = await f.format(REPLY)
+  assert.equal(r.via, 'fallback')
+  assert.equal(r.reason, 'no-model-route')
+  assert.equal(calls.length, 0, '不应发起任何模型调用')
 })
