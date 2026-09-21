@@ -18,7 +18,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { describeReply, buildNotificationCard } from '../lib/shared/progressive.js'
+import { describeReply, buildNotificationCard, buildNotificationCardV2 } from '../lib/shared/progressive.js'
 import { createFeishuApi } from '../lib/host/feishu-api.js'
 
 const argv = process.argv.slice(2)
@@ -61,31 +61,70 @@ function pickPayload() {
     const row = idx >= 0 ? rows[idx] : rows.reduce((a, b) => (b.text.length > a.text.length ? b : a))
     return { text: row.text, label: `${row.session} turn ${row.turn}` }
   }
-  // 无外部语料时用一段内置样本，保证探针可独立运行
-  const text = [
-    '## 交付物',
-    '',
-    '本轮把出站通知改成渐进披露卡片：',
-    '',
-    '- 结论行与要点常驻可见',
-    '- 正文收进折叠面板，展开不新增消息',
-    '- 卡片不可用时回退纯文本，复用同一幂等 uuid',
-    '',
-    '这是一段用来把折叠面板撑开的正文。'.repeat(12),
-  ].join('\n')
-  return { text, label: 'builtin-sample' }
+  // 无外部语料时用内置样本，保证探针可独立运行。
+  // --v2 用「Markdown 能力自检」样本：标题/表格/引用/代码块/列表各一，
+  // 一次投递就能看出该客户端到底渲染了哪些语法（2.0 需 ≥7.20）。
+  const text = has('v2')
+    ? [
+        '# 一级标题（仅 2.0 支持）',
+        '',
+        '正文含 **加粗**、`行内代码` 与 [链接](https://open.feishu.cn)。',
+        '',
+        '| 语法 | 1.0 | 2.0 |',
+        '| --- | --- | --- |',
+        '| 标题 | ✗ | ✓ |',
+        '| 表格 | ✗ | ✓ |',
+        '| 引用 | ✗ | ✓ |',
+        '',
+        '> 引用块（仅 2.0 支持）',
+        '',
+        '- 列表项一',
+        '- 列表项二',
+        '',
+        '```json',
+        '{"codeBlock": "代码块"}',
+        '```',
+        '',
+        '---',
+        '',
+        '以上为 Markdown 能力自检。'.repeat(8),
+      ].join('\n')
+    : [
+        '## 交付物',
+        '',
+        '本轮把出站通知改成渐进披露卡片：',
+        '',
+        '- 结论行与要点常驻可见',
+        '- 正文收进折叠面板，展开不新增消息',
+        '- 卡片不可用时回退纯文本，复用同一幂等 uuid',
+        '',
+        '这是一段用来把折叠面板撑开的正文。'.repeat(12),
+      ].join('\n')
+  return { text, label: has('v2') ? 'builtin-markdown-capability' : 'builtin-sample' }
 }
 
 const { text, label } = pickPayload()
+const useV2 = !!has('v2')
 const layers = describeReply(text)
-const card = buildNotificationCard({ title: 'dsh 回复总结', turn: 1, cwd: process.cwd(), layers })
+const card = useV2
+  ? buildNotificationCardV2({
+      title: 'dsh 回复总结',
+      turn: 1,
+      summary: layers.header,
+      bullets: layers.bullets,
+      detail: text,
+      cwd: process.cwd(),
+    })
+  : buildNotificationCard({ title: 'dsh 回复总结', turn: 1, cwd: process.cwd(), layers })
 const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8')
+const elements = card.elements ?? card.body?.elements ?? []
 
 console.log(`载荷来源：${label}（${text.length} 字）`)
-console.log(`头部[${layers.headerSource}]：${layers.header}`)
+console.log(`卡片结构：${useV2 ? 'JSON 2.0（需客户端 ≥7.20）' : 'JSON 1.0'}`)
+console.log(`摘要[${layers.headerSource}]：${layers.header}`)
 console.log(`要点 ${layers.bullets.length} 条｜折叠 ${layers.folded}｜截断 ${layers.truncated}`)
 console.log(`卡片 JSON：${bytes} 字节（安全线 24576，硬上限 30720）`)
-console.log(`元素：${card.elements.map((e) => e.tag).join(', ')}`)
+console.log(`元素：${elements.map((e) => e.tag).join(', ')}`)
 
 if (has('dry-run')) {
   console.log('\n--dry-run：未发送')
