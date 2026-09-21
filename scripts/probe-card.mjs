@@ -18,7 +18,8 @@ import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
-import { describeReply, buildNotificationCard, buildNotificationCardV2 } from '../lib/shared/progressive.js'
+import { buildNotificationCardV2 } from '../lib/shared/progressive.js'
+import { fallbackDigest } from '../lib/shared/notification-digest.js'
 import { createFeishuApi } from '../lib/host/feishu-api.js'
 
 const argv = process.argv.slice(2)
@@ -104,25 +105,23 @@ function pickPayload() {
 }
 
 const { text, label } = pickPayload()
-const useV2 = !!has('v2')
-const layers = describeReply(text)
-const card = useV2
-  ? buildNotificationCardV2({
-      title: 'dsh 回复总结',
-      turn: 1,
-      summary: layers.header,
-      bullets: layers.bullets,
-      detail: text,
-      cwd: process.cwd(),
-    })
-  : buildNotificationCard({ title: 'dsh 回复总结', turn: 1, cwd: process.cwd(), layers })
+// 1.0 卡片与确定性抽取已在第三批删除，探针固定发 2.0；摘要用确定性兜底（探针不发 LLM 请求）。
+const digest = fallbackDigest(text)
+const card = buildNotificationCardV2({
+  title: 'dsh 回复总结',
+  turn: 1,
+  summary: digest.summary,
+  bullets: digest.bullets,
+  detail: text,
+  cwd: process.cwd(),
+})
 const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8')
 const elements = card.elements ?? card.body?.elements ?? []
 
 console.log(`载荷来源：${label}（${text.length} 字）`)
-console.log(`卡片结构：${useV2 ? 'JSON 2.0（需客户端 ≥7.20）' : 'JSON 1.0'}`)
-console.log(`摘要[${layers.headerSource}]：${layers.header}`)
-console.log(`要点 ${layers.bullets.length} 条｜折叠 ${layers.folded}｜截断 ${layers.truncated}`)
+console.log('卡片结构：JSON 2.0（需客户端 ≥7.20）')
+console.log(`摘要：${digest.summary}`)
+console.log(`要点 ${digest.bullets.length} 条｜折叠 ${text.length > 400}`)
 console.log(`卡片 JSON：${bytes} 字节（安全线 24576，硬上限 30720）`)
 console.log(`元素：${elements.map((e) => e.tag).join(', ')}`)
 
