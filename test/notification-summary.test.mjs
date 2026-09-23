@@ -117,14 +117,18 @@ function mockCtx(chunks, services = {}) {
       for (const c of chunks) yield c
     })()
   }
-  return {
-    calls,
-    ctx: {
-      // 插件用 ctx.get('llm') 取服务（llm 不是硬依赖），mock 必须提供 get。
-      get: (name) => (name === 'llm' ? { stream } : services[name]),
-      llm: { stream },
+  const store = { llm: { stream }, ...services }
+  // Cordis 语义：`ctx.<service>` 属性代理只对 inject 里声明过的服务可用，读未声明的
+  // 服务会抛 `cannot get property "X" without inject`，而不是返回 undefined。
+  // mock 必须照做，否则「用属性代理读未注入服务」这类真实缺陷会被测试掩盖。
+  const ctx = new Proxy({}, {
+    get(_target, prop) {
+      if (prop === 'get') return (name) => store[name]
+      if (prop in store) throw new Error(`cannot get property "${String(prop)}" without inject`)
+      return undefined
     },
-  }
+  })
+  return { calls, ctx }
 }
 
 const VALID_JSON = JSON.stringify({ summary: '打包 3114176 成功', bullets: ['结论行与要点常驻可见'] })
@@ -202,17 +206,31 @@ test('provider 抛错 → 回退，不冒泡', async () => {
 // ── 路由解析：零配置可用，且不写死任何 provider ─────────────────────────
 
 test('路由解析：显式配置优先于 agent 默认模型', () => {
-  const { ctx } = mockCtx([])
-  ctx.agentDefaultModel = { currentSelection: () => ({ provider: 'agent-prov', model: 'agent-model' }) }
+  const { ctx } = mockCtx([], {
+    agentDefaultModel: { currentSelection: () => ({ provider: 'agent-prov', model: 'agent-model' }) },
+  })
   const f = createNotificationFormatter({ ctx, config: { provider: 'cfg-prov', model: 'cfg-model' } })
   assert.deepEqual(f.resolveRoute(), { provider: 'cfg-prov', model: 'cfg-model' })
 })
 
-test('路由解析：未显式配置时用 agent 默认模型', () => {
-  const { ctx } = mockCtx([])
-  ctx.agentDefaultModel = { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) }
+test('路由解析：未显式配置时用 agent 默认模型（经 ctx.get 读取）', () => {
+  const { ctx } = mockCtx([], {
+    agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' }) },
+  })
   const f = createNotificationFormatter({ ctx, config: {} })
   assert.deepEqual(f.resolveRoute(), { provider: 'deepseek-official', model: 'deepseek-flash' })
+})
+
+test('回归：未注入的服务读属性会抛错，但路由不得因此丢失', () => {
+  // 线上真实形态：agentDefaultModel 不在插件 inject 列表里，Cordis 的属性代理读它会抛
+  // `cannot get property … without inject`。早前实现正是用属性代理读、异常又被静默
+  // 吞掉，于是每次都退回确定性兜底，LLM 从未被真正调用。
+  const { ctx } = mockCtx([], {
+    agentDefaultModel: { currentSelection: () => ({ provider: 'raven-cc', model: 'deepseek-flash-latest' }) },
+  })
+  assert.throws(() => ctx.agentDefaultModel, /without inject/, 'mock 必须复现 Cordis 的 inject 门禁')
+  const f = createNotificationFormatter({ ctx, config: {} })
+  assert.deepEqual(f.resolveRoute(), { provider: 'raven-cc', model: 'deepseek-flash-latest' })
 })
 
 test('两条路由都拿不到 → 不调模型，直接确定性兜底', async () => {

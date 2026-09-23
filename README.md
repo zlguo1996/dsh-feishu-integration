@@ -80,6 +80,25 @@ $DSH_HOME/cordis.patch.yml
 
 修改 patch 后可热重载配置；插件代码或依赖变化需要重启 DSH Web。
 
+## 通知摘要与 LLM 配置
+
+出站总结的摘要由**发送层 LLM 受约束压缩**产出，不用会话模型、不产生会话回合。它默认**零配置**工作：provider/model 优先取下面的显式配置，未配置时取 DSH 设置页的 **agent 默认模型**；两者都拿不到才回退到确定性兜底（首段首句 + 首个列表块前 3 条）。
+
+```yaml
+- id: dsh-feishu-integration
+  config:
+    notificationFormatter:
+      enabled: true                 # false = 完全关闭 LLM，只用确定性兜底
+      provider: raven-cc            # 省略则继承 agent 默认模型的 provider
+      model: deepseek-flash-latest  # 省略则继承 agent 默认模型的 model
+      timeoutMs: 1500               # 硬 deadline，200–2000；超时即回退，绝不阻塞通知
+      maxTokens: 400
+```
+
+给通知单独指定一个更快/更便宜的模型就填 `provider` + `model`；想跟随日常用的模型就整块省略。两者必须**同时**给出才生效——只给一个会被忽略并回落到 agent 默认模型。
+
+排障：摘要走兜底时宿主日志会打 `[formatter] agent 默认模型未给出 provider/model，回退确定性兜底`（warn 级），以及 `[总结] 摘要走确定性兜底: <reason>`（info 级）。若两条都拿不到模型，说明当前 profile 里既没有显式配置、agent 默认模型也未解析出来。
+
 ## CLI 管理
 
 设置页是推荐入口。CLI 仍然保留，方便自动化和无 UI 环境：
@@ -197,6 +216,25 @@ node --check lib/index.js
 When an inbound message is routed to a mapped DSH session, the plugin immediately replies in the same Feishu thread with the workspace path, session title, and session ID. That acknowledgement message is mapped to the same session, so follow-up replies continue in the same conversation.
 
 If the answer does not arrive before the timeout (600s by default), the plugin stays silent in Feishu — no failure message, no error reaction. The routing acknowledgement already served as the delivery receipt; timeouts are only logged host-side. Genuine errors still get a failure reply.
+
+### Notification summaries and LLM configuration
+
+The outbound summary is produced by a constrained **send-side LLM call** — it does not use the session model and does not open a session turn. It works with **zero configuration**: `provider`/`model` come from the explicit config below, otherwise from the DSH **agent default model** in Settings; when neither resolves, the plugin falls back to a deterministic digest (first paragraph's first sentence plus the first three list items).
+
+```yaml
+- id: dsh-feishu-integration
+  config:
+    notificationFormatter:
+      enabled: true                 # false disables the LLM entirely (deterministic digest only)
+      provider: raven-cc            # omit to inherit the agent default model's provider
+      model: deepseek-flash-latest  # omit to inherit the agent default model's model
+      timeoutMs: 1500               # hard deadline, 200–2000; on timeout it falls back, never blocks
+      maxTokens: 400
+```
+
+Set `provider` + `model` to pin a faster or cheaper model for notifications only; omit the block to follow the model you already use. Both fields must be present together — a lone `provider` or `model` is ignored and the agent default model is used instead.
+
+Troubleshooting: a summary that falls back logs `[formatter] agent 默认模型未给出 provider/model，回退确定性兜底` (warn) and `[总结] 摘要走确定性兜底: <reason>` (info). If neither source yields a model, the profile has no explicit config and the agent default model did not resolve either.
 
 ### Session question relay (`answerFromFeishu`)
 
