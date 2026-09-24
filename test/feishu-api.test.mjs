@@ -58,3 +58,41 @@ test('invalid-token business codes are surfaced (and would evict cache)', async 
     fail.restore()
   }
 })
+
+// ── 线程回帖的真实契约（2026-09-24 回归）────────────────────────────────
+// 出站线程投递曾把 replyToMessage 调成 (creds, rootId, text, opts)，而真实签名是
+// `({appId, appSecret, messageId}, text, opts)` —— messageId 变成 undefined，飞书返回
+// 400 `Invalid ids: [undefined]`，于是「根卡片在、线程永远不出现」。当时的单测 mock 与
+// 实现犯的是同一个错，所以全绿。这里用假 fetch 直接锁 URL 与请求体，不经过调用方 mock。
+test('replyToMessage 的真实契约：messageId 进 URL，reply_in_thread 与 uuid 进请求体', async () => {
+  const api = createFeishuApi()
+  const fake = withFakeFetch((_i, req) => {
+    if (req.url.includes('/auth/v3/tenant_access_token/internal')) {
+      return new Response(JSON.stringify({ code: 0, tenant_access_token: 'tk', expire: 7200 }), { headers: { 'content-type': 'application/json' } })
+    }
+    return new Response(JSON.stringify({
+      code: 0,
+      data: { message_id: 'om_reply', root_id: 'om_root', parent_id: 'om_root', thread_id: 'omt_x' },
+    }), { headers: { 'content-type': 'application/json' } })
+  })
+  try {
+    const out = {}
+    const id = await api.replyToMessage(
+      { appId: 'cli_x', appSecret: 's', messageId: 'om_root' },
+      '完整回复正文',
+      { replyInThread: true, uuid: 'u-c0', out },
+    )
+    assert.equal(id, 'om_reply')
+    assert.deepEqual(out, { rootId: 'om_root', parentId: 'om_root', threadId: 'omt_x' },
+      '必须回填 thread_id（出站线程记账/排障依赖它）')
+    const reply = fake.calls.find((c) => c.url.includes('/reply'))
+    assert.ok(reply, '必须打到 /reply 端点')
+    assert.ok(reply.url.endsWith('/im/v1/messages/om_root/reply'),
+      `URL 必须内嵌 messageId，实际 ${reply.url}`)
+    assert.equal(reply.body.reply_in_thread, true, '首次线程回复必须带 reply_in_thread')
+    assert.equal(reply.body.uuid, 'u-c0')
+    assert.match(reply.body.content, /完整回复正文/)
+  } finally {
+    fake.restore()
+  }
+})

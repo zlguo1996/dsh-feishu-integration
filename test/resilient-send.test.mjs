@@ -5,7 +5,20 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createResilientSender, computeBackoffMs } from '../lib/host/resilient-send.js'
+import { createResilientSender, computeBackoffMs, defaultIsReachable } from '../lib/host/resilient-send.js'
+
+test('默认可达性探测：走回调式 dns.lookup，绝不因回调缺失而抛错', async () => {
+  // 回归（2026-09-24 实测于验证实例）：曾经是
+  //   dnsLookup(host, { timeout: 2000 }).then(...)
+  // 缺 callback → ERR_INVALID_ARG_TYPE；而且抛在**重试路径**上（backoffAndWait →
+  // isReachable），于是「一次瞬时发送失败 + 一次探测」= 整条投递链路中断，磁盘上
+  // 只留下「根消息在、线程不在」。这里锁住两点：返回 Promise（不抛），且值为 boolean。
+  const promise = defaultIsReachable('localhost')
+  assert.equal(typeof promise.then, 'function')
+  assert.equal(await promise, true, 'localhost 走 /etc/hosts，必然可解析')
+  const bogus = await defaultIsReachable('definitely-not-a-real-host.invalid', 1500)
+  assert.equal(bogus, false, '解析不了应返回 false 而不是抛错')
+})
 
 function makeHarness({ reachableSequence = null, failTimes = 0, maxAttempts = 10 } = {}) {
   const events = { sends: 0, sleeps: [], logs: [] }

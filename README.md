@@ -82,7 +82,27 @@ $DSH_HOME/cordis.patch.yml
 
 ## 通知摘要与 LLM 配置
 
-出站总结的摘要由**发送层 LLM 受约束压缩**产出，不用会话模型、不产生会话回合。它默认**零配置**工作：provider/model 优先取下面的显式配置，未配置时取 DSH 设置页的 **agent 默认模型**；两者都拿不到才回退到确定性兜底（首段首句 + 首个列表块前 3 条）。
+### 卡片形态与话题承接
+
+每条完成的回合产生一条**话题根消息**：
+
+```text
+顶层消息（2.0 卡片）= 飞书话题根
+├─ 标题：本回合提问在讲什么（≤20 字，formatter 产出；取不到来源时用「本回合回复」）
+├─ 摘要：针对本回合提问的一句话（≤80 字）+ 0~3 条要点
+├─ 元信息：turn N · cwd: X
+└─ 线程回复：完整回复，**以卡片发出**（首条带 reply_in_thread=true，创建飞书原生话题）
+```
+
+完整回复**不在卡片里折叠**：读者点卡片上的「N 条回复 / 话题」进入线程读原文。卡片只承载「一眼看懂」，正文既不占卡身体积、也不额外增加一次点击。仅当线程能力不可用（`threadDelivery: false`）时才回退为「正文折回卡片/纯文本」。
+
+⚠️ 线程里的完整回复**必须以卡片（interactive）发出**：飞书**纯文本消息不渲染 Markdown**，`**加粗**` 会原样显示成星号；只有卡片的 markdown 组件会渲染加粗/标题/列表/表格。分段按**卡片字节预算**切（30KB 硬上限），不是按字符数。老客户端不支持卡片时，该分段退化为纯文本（内容仍送达，但 Markdown 不渲染），并记 `thread-text-fallback` 日志。
+
+formatter 的输入是三段式：`PRIOR_CONTEXT`（最近 5 条会话项 = 用户输入与当时的回复总结，缺失不补造）、`CURRENT_QUESTION`（本回合直接人类提问）、`CURRENT_ASSISTANT_REPLY`（本回合回复）。历史只用于消解指代，**不授权任何事实**：标题的事实来源是本回合提问，摘要/要点的事实来源是本回合回复。
+
+每个回合产出的摘要**先落盘再投递**到 `$DSH_HOME/integrations/dsh-feishu/digest-history.json`（只存摘要文本，不存回复全文；每 session 保留最近 20 回合、7 天 TTL），供后续回合当历史背景。
+
+出站总结的摘要由**发送层 LLM 受约束压缩**产出，不用会话模型、不产生会话回合。它默认**零配置**工作：provider/model 优先取下面的显式配置，未配置时取 DSH 设置页的 **agent 默认模型**；两者都拿不到才回退到确定性兜底（引用式标题 + 首段首句 + 首个列表块前 3 条）。
 
 ```yaml
 - id: dsh-feishu-integration
@@ -93,6 +113,10 @@ $DSH_HOME/cordis.patch.yml
       model: deepseek-flash-latest  # 省略则继承 agent 默认模型的 model
       timeoutMs: 1500               # 硬 deadline，200–10000；超时即回退，绝不阻塞通知
       maxTokens: 400
+    threadDelivery: true            # false = 不建话题，完整回复折回卡片/纯文本（降级）
+    digestHistoryMaxTurns: 20       # 每个 session 保留的摘要历史回合数
+    replyMaxChars: 9000             # 单个线程分段上限
+    # title 已废弃：卡片标题改由 formatter 按本回合提问产出，不再使用固定文案
 ```
 
 给通知单独指定一个更快/更便宜的模型就填 `provider` + `model`；想跟随日常用的模型就整块省略。两者必须**同时**给出才生效——只给一个会被忽略并回落到 agent 默认模型。
@@ -104,7 +128,9 @@ $DSH_HOME/cordis.patch.yml
 - `stream-error(<code> / HTTP <status> / <provider 原文>)` — 请求发出去了但 provider 报错（路由指向的本地代理没起、凭据失效等）；
 - `empty-output(chunks=…,finish=…)` — 流正常结束但一个 text-delta 都没有；
 - `unparsable-output` — 有输出但不是契约要求的 JSON；
-- `source-coverage` / `summary-too-long` 等 — 输出违反契约（例如引入了原文没有的数字）。
+- `title-too-long:<n>` — 标题超过 20 字（模型输出直接打回，代码不会替你「修好」）；
+- `title-source-coverage` — 标题引用了本回合提问里没有的事实 token；
+- `source-coverage` / `summary-too-long` 等 — 摘要/要点违反契约（例如引入了本回合回复里没有的数字）。
 
 另有 `[总结] 摘要走确定性兜底: <reason>` 一行汇总。这些以前是 info 级、**磁盘上什么都看不到**，现在统一提到 warn。
 
@@ -253,9 +279,26 @@ When an inbound message is routed to a mapped DSH session, the plugin immediatel
 
 If the answer does not arrive before the timeout (600s by default), the plugin stays silent in Feishu — no failure message, no error reaction. The routing acknowledgement already served as the delivery receipt; timeouts are only logged host-side. Genuine errors still get a failure reply.
 
-### Notification summaries and LLM configuration
+### Notification card and LLM configuration
 
-The outbound summary is produced by a constrained **send-side LLM call** — it does not use the session model and does not open a session turn. It works with **zero configuration**: `provider`/`model` come from the explicit config below, otherwise from the DSH **agent default model** in Settings; when neither resolves, the plugin falls back to a deterministic digest (first paragraph's first sentence plus the first three list items).
+Each completed turn produces one **thread-root message**:
+
+```text
+Top-level message (card 2.0) = Feishu thread root
+├─ Title: what the current question is about (<=20 chars, produced by the formatter)
+├─ Summary: one question-targeted line (<=80 chars) + 0-3 bullets
+├─ Meta: turn N · cwd: X
+└─ Threaded reply: the complete assistant reply, sent AS A CARD
+   (the first reply carries reply_in_thread=true, which creates the native thread)
+```
+
+The full reply is **not** collapsed inside the card: readers tap Feishu's native reply-count entry and read it in the thread. ⚠️ Each thread chunk is sent as a **card** (msg_type interactive): Feishu **plain-text messages do not render Markdown** (`**bold**` shows the asterisks literally); only a card's markdown component renders bold/headings/lists/tables. Chunks are split by the card **byte** budget (30KB hard limit), not by character count. On clients that reject cards, that chunk degrades to plain text (content still delivered, Markdown unrendered) and logs `thread-text-fallback`. The card only carries the at-a-glance layer. The in-card collapsible panel remains solely as the explicit degradation when thread delivery is unavailable (`threadDelivery: false`).
+
+The formatter input is three sections: `PRIOR_CONTEXT` (the latest five conversational items — user inputs and the summaries actually produced for those turns; missing summaries are never fabricated), `CURRENT_QUESTION`, and `CURRENT_ASSISTANT_REPLY`. Prior context only resolves references — it never authorizes a fact: the `title` is validated against the current question, and `summary`/`bullets` against the current reply.
+
+Every produced summary is persisted to `$DSH_HOME/integrations/dsh-feishu/digest-history.json` **before** delivery (summary text only, never full replies; 20 turns per session, 7-day TTL), so later turns can use it as context.
+
+The outbound summary itself is produced by a constrained **send-side LLM call** — it does not use the session model and does not open a session turn. It works with **zero configuration**: `provider`/`model` come from the explicit config below, otherwise from the DSH **agent default model** in Settings; when neither resolves, the plugin falls back to a deterministic digest (a quote-only title plus the first paragraph's first sentence and the first three list items).
 
 ```yaml
 - id: dsh-feishu-integration
@@ -264,8 +307,12 @@ The outbound summary is produced by a constrained **send-side LLM call** — it 
       enabled: true                 # false disables the LLM entirely (deterministic digest only)
       provider: raven-cc            # omit to inherit the agent default model's provider
       model: deepseek-flash-latest  # omit to inherit the agent default model's model
-      timeoutMs: 1500               # hard deadline, 200–10000; on timeout it falls back, never blocks
+      timeoutMs: 1500               # hard deadline, 200-10000; on timeout it falls back, never blocks
       maxTokens: 400
+    threadDelivery: true            # false = no thread; the full reply folds back into the card/text
+    digestHistoryMaxTurns: 20       # summary-history turns retained per session
+    replyMaxChars: 9000             # per-chunk limit for threaded replies
+    # `title` is deprecated: the card title now comes from the formatter's per-question topic
 ```
 
 Set `provider` + `model` to pin a faster or cheaper model for notifications only; omit the block to follow the model you already use. Both fields must be present together — a lone `provider` or `model` is ignored and the agent default model is used instead.

@@ -17,7 +17,8 @@ import assert from 'node:assert/strict'
 import { createNotificationFormatter } from '../lib/host/notification-formatter.js'
 
 const REPLY = '最终定位：连接池耗尽，建议把 maxPool 从 10 提到 20。'
-const GOOD_DIGEST = { summary: '连接池耗尽', bullets: ['建议把 maxPool 从 10 提到 20'] }
+// title 必须在 ≥1 字且 ≤20 字，且 token 能在「提问（缺省时退化为回复）」里找到。
+const GOOD_DIGEST = { title: '连接池耗尽', summary: '连接池耗尽', bullets: ['建议把 maxPool 从 10 提到 20'] }
 
 /**
  * 伪造 Cordis 风格的 ctx：
@@ -97,6 +98,7 @@ test('LLM 返回合法 JSON 时走 via:llm，并带上解析出的摘要', async
 
   assert.equal(digest.via, 'llm')
   assert.equal(digest.reason, undefined)
+  assert.equal(digest.title, '连接池耗尽')
   assert.equal(digest.summary, '连接池耗尽')
   assert.deepEqual(digest.bullets, ['建议把 maxPool 从 10 提到 20'])
   // 路由与调用参数确实是按契约传下去的
@@ -231,13 +233,70 @@ test('provider 抛错时把错误信息带进 reason，而不是静默兜底', a
 test('输出引入原文没有的数字会被契约打回，并给出 source-coverage', async () => {
   const ctx = makeCordisLikeCtx({
     services: {
-      llm: makeLlm({ chunks: textChunks(JSON.stringify({ summary: '连接池耗尽', bullets: ['建议把 maxPool 提到 999'] })) }),
+      llm: makeLlm({ chunks: textChunks(JSON.stringify({ title: '连接池耗尽', summary: '连接池耗尽', bullets: ['建议把 maxPool 提到 999'] })) }),
       agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
     },
   })
   const digest = await createNotificationFormatter({ ctx, config: {} }).format(REPLY)
   assert.equal(digest.via, 'fallback')
   assert.equal(digest.reason, 'source-coverage')
+})
+
+// ── title 的按字段来源权威（Codex FINAL 修订版）────────────────────────────
+
+test('title 的来源权威是「本回合提问」：只在回复里出现的 token 不能写进标题', async () => {
+  const question = '帮我看看代理为什么连不上'
+  const ctx = makeCordisLikeCtx({
+    services: {
+      // 20 只在回复里（maxPool 从 10 提到 20），提问里没有 → 标题不得引用它
+      llm: makeLlm({ chunks: textChunks(JSON.stringify({ title: 'maxPool 提到 20', summary: '连接池耗尽', bullets: [] })) }),
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    },
+  })
+  const digest = await createNotificationFormatter({ ctx, config: {} }).format(REPLY, { question })
+  assert.equal(digest.via, 'fallback')
+  assert.equal(digest.reason, 'title-source-coverage')
+})
+
+test('title 的 token 出现在提问里就通过（同一份输出，换一个提问即可）', async () => {
+  const question = 'maxPool 20 是不是太小了'
+  const ctx = makeCordisLikeCtx({
+    services: {
+      llm: makeLlm({ chunks: textChunks(JSON.stringify({ title: 'maxPool 提到 20', summary: '连接池耗尽', bullets: [] })) }),
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    },
+  })
+  const digest = await createNotificationFormatter({ ctx, config: {} }).format(REPLY, { question })
+  assert.equal(digest.via, 'llm')
+  assert.equal(digest.title, 'maxPool 提到 20')
+})
+
+test('历史上下文（PRIOR_CONTEXT）不授权任何事实：只在历史里出现的数字会被打回', async () => {
+  const question = '接着刚才那件事继续说'
+  const priorItems = [{ turn: 1, kind: 'user', text: '之前 maxPool 是 999' }]
+  const ctx = makeCordisLikeCtx({
+    services: {
+      llm: makeLlm({ chunks: textChunks(JSON.stringify({ title: '接着刚才那件事', summary: '连接池耗尽', bullets: ['把 999 改小'] })) }),
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    },
+  })
+  const digest = await createNotificationFormatter({ ctx, config: {} }).format(REPLY, { question, priorItems })
+  assert.equal(digest.via, 'fallback')
+  assert.equal(digest.reason, 'source-coverage')
+})
+
+test('超过 20 字的标题一律打回（含恰好 21 字），不由代码「修好」', async () => {
+  const longTitle = '一二三四五六七八九十一二三四五六七八九十一'  // 21 字
+  assert.equal(longTitle.length, 21)
+  const ctx = makeCordisLikeCtx({
+    services: {
+      llm: makeLlm({ chunks: textChunks(JSON.stringify({ title: longTitle, summary: '连接池耗尽', bullets: [] })) }),
+      agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    },
+  })
+  const digest = await createNotificationFormatter({ ctx, config: {} }).format(REPLY, { question: longTitle })
+  assert.equal(digest.via, 'fallback')
+  assert.equal(digest.reason, 'title-too-long:21')
 })
 
 test('enabled:false 时完全不调 LLM', async () => {

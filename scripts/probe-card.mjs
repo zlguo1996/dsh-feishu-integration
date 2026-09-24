@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
- * 卡片渲染探针：用真实凭据 + 真实载荷发一张卡片，供人工确认渲染。
+ * 卡片渲染探针：用真实凭据 + 真实载荷发一张话题根卡片，供人工确认渲染。
  *
- * 这是 progressive disclosure 卡片的「上线门禁」：卡片在飞书客户端里长什么样、
- * 折叠面板能否展开、响应是否回传 message_id（reply-map 回复路由依赖它），
- * 都只能靠一次真实投递来确认，单测覆盖不到。
+ * 这是新信息架构的「上线门禁」，单测覆盖不到的部分都靠一次真实投递确认：
+ * 根卡片的标题/摘要/元信息在飞书客户端里长什么样、响应是否回传 message_id
+ * （reply-map 回复路由依赖它）、以及 `--thread` 时首条线程回复是否真的创建了
+ * 原生话题（客户端出现「N 条回复 / 话题」入口）。
  *
  * 用法：
  *   node scripts/probe-card.mjs --dry-run            # 只打印将要发送的卡片与体积
- *   node scripts/probe-card.mjs                      # 真发一张（发到 bot owner 自己）
+ *   node scripts/probe-card.mjs                      # 真发一张根卡片（发到 bot owner）
+ *   node scripts/probe-card.mjs --thread             # 再补一条线程回复（完整回复的位置）
+ *   node scripts/probe-card.mjs --v2 --thread        # 用 Markdown 能力样本作完整回复
  *   node scripts/probe-card.mjs --corpus x.jsonl --index 3
  *
  * 凭据从 DSH 凭据库读取，绝不打印密钥本体。
@@ -105,14 +108,15 @@ function pickPayload() {
 }
 
 const { text, label } = pickPayload()
-// 1.0 卡片与确定性抽取已在第三批删除，探针固定发 2.0；摘要用确定性兜底（探针不发 LLM 请求）。
+// 探针固定发 2.0 话题根卡片；摘要用确定性兜底（探针不发 LLM 请求）。
+// 信息架构（Codex FINAL 修订版）：卡片 = 话题根（标题 + 摘要 + 要点 + turn/cwd），
+// 完整回复**不进卡片**，由 `--thread` 的线程回复承接。
 const digest = fallbackDigest(text)
 const card = buildNotificationCardV2({
-  title: 'dsh 回复总结',
+  title: digest.title,
   turn: 1,
   summary: digest.summary,
   bullets: digest.bullets,
-  detail: text,
   cwd: process.cwd(),
 })
 const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8')
@@ -120,8 +124,9 @@ const elements = card.elements ?? card.body?.elements ?? []
 
 console.log(`载荷来源：${label}（${text.length} 字）`)
 console.log('卡片结构：JSON 2.0（需客户端 ≥7.20）')
+console.log(`标题（主题）：${digest.title}`)
 console.log(`摘要：${digest.summary}`)
-console.log(`要点 ${digest.bullets.length} 条｜折叠 ${text.length > 400}`)
+console.log(`要点 ${digest.bullets.length} 条｜元信息仅 turn/cwd｜卡片不含完整回复`)
 console.log(`卡片 JSON：${bytes} 字节（安全线 24576，硬上限 30720）`)
 console.log(`元素：${elements.map((e) => e.tag).join(', ')}`)
 
@@ -137,20 +142,45 @@ const refs = readSecretRefs(join(dshHome, '.credentials.yaml'))
 const secret = refs[bot.secretRef]
 if (!secret) throw new Error(`凭据库里没有 ${bot.secretRef}`)
 
-const receiveId = val('to', bot.ownerOpenIds?.[0])
-if (!receiveId) throw new Error('bot 没有 ownerOpenIds，请用 --to 指定 open_id')
+// 目的地：--to 显式指定 > 入站学到的 lastChatId > ownerOpenIds。
+// 为什么优先 chat_id：实测同一应用以 open_id 主动发送会被拒
+// （230101 "Sending messages to users is temporarily unavailable."）。
+let target = val('to', null)
+let receiveType = target ? 'open_id' : null
+if (!target) {
+  let learned = null
+  try {
+    learned = JSON.parse(readFileSync(join(feishuDir, 'bots', bot.id, 'state.json'), 'utf8')).lastChatId
+  } catch { learned = null }
+  if (learned) { target = learned; receiveType = 'chat_id' } else if (bot.ownerOpenIds?.[0]) {
+    target = bot.ownerOpenIds[0]; receiveType = 'open_id'
+  }
+}
+if (!target) throw new Error('bot 没有可用接收目标，请用 --to 指定')
 
 const api = createFeishuApi()
 const out = {}
 try {
   const messageId = await api.sendCardMessage(
-    { appId: bot.appId, appSecret: secret, receiveId, receiveType: 'open_id' },
+    { appId: bot.appId, appSecret: secret, receiveId: target, receiveType },
     card,
     { out },
   )
-  console.log(`\n已发送 ✅ message_id=${messageId || '(空)'}`)
-  console.log(`root_id=${out.rootId ?? '-'} parent_id=${out.parentId ?? '-'}`)
-  if (!messageId) console.log('⚠️ 未回传 message_id：reply-map 的回复路由会退化，需要处理')
+  console.log(`\n已发送 ✅ message_id=${messageId || '(空)'}（${receiveType}）`)
+  if (!messageId) {
+    console.log('⚠️ 未回传 message_id：reply-map 的回复路由会退化，需要处理')
+    process.exit(1)
+  }
+  if (has('thread')) {
+    const out2 = {}
+    const replyId = await api.replyToMessage(
+      { appId: bot.appId, appSecret: secret, messageId },
+      text,
+      { replyInThread: true, out: out2 },
+    )
+    console.log(`线程回复 ✅ message_id=${replyId || '(空)'} thread_id=${out2.threadId ?? '-'}`)
+    console.log('请到飞书客户端确认：根卡片出现「N 条回复 / 话题」入口，点进去能看到完整回复（含 Markdown 渲染）。')
+  }
 } catch (err) {
   console.log(`\n发送失败 ❌ feishuCode=${err?.feishuCode ?? '-'} httpStatus=${err?.httpStatus ?? '-'}`)
   console.log(String(err?.message ?? err).slice(0, 400))

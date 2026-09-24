@@ -37,9 +37,10 @@ import {
   fallbackDigest,
   isQuoteOf,
   parseDigestJson,
-  summarizeForLlm,
   validateDigest,
+  TITLE_FALLBACK_SENTINEL,
 } from '../lib/shared/notification-digest.js'
+import { buildFormatterInput } from '../lib/shared/formatter-input.js'
 import { SYSTEM_PROMPT } from '../lib/host/notification-formatter.js'
 
 const DEFAULT_CORPUS = '.backtest/corpus.jsonl'
@@ -137,6 +138,8 @@ function audit(rows) {
     const bad = []
     if (!isQuoteOf(d.summary, r.text)) bad.push('summary')
     for (const b of d.bullets) if (!isQuoteOf(b, r.text)) bad.push('bullet')
+    // 标题也必须是引用（结构哨兵除外：它只在没有任何可用来源时出现，不是引用）。
+    if (d.title !== TITLE_FALLBACK_SENTINEL && !isQuoteOf(d.title, r.text)) bad.push('title')
     if (bad.length) violations.push({ session: r.session, turn: r.turn, bad, summary: d.summary })
   }
   return violations
@@ -148,17 +151,17 @@ function backtest() {
   const N = rows.length
   const pct = (n) => ((n / N) * 100).toFixed(1) + '%'
 
-  let folded = 0, withBullets = 0, emptySummary = 0, overBudget = 0, totalBytes = 0
+  let withBullets = 0, emptySummary = 0, overBudget = 0, totalBytes = 0, withPanel = 0
   const summaryLens = []
   for (const r of rows) {
     const d = fallbackDigest(r.text)
-    if (r.text.length > 400) folded++
     if (d.bullets.length) withBullets++
     if (!d.summary) emptySummary++
     summaryLens.push(d.summary.length)
     const card = buildNotificationCardV2({
-      title: 'dsh 回复总结', turn: r.turn, summary: d.summary, bullets: d.bullets, detail: r.text,
+      title: d.title, turn: r.turn, summary: d.summary, bullets: d.bullets,
     })
+    if (JSON.stringify(card).includes('collapsible_panel')) withPanel++
     const bytes = Buffer.byteLength(JSON.stringify(card), 'utf8')
     totalBytes += bytes
     if (!cardFitsBudget(card)) overBudget++
@@ -168,7 +171,7 @@ function backtest() {
 
   console.log(`语料：${N} 条载荷，来自 ${new Set(rows.map((r) => r.session)).size} 个会话`)
   console.log(`兜底摘要长度：p10=${q(0.1)} p50=${q(0.5)} p90=${q(0.9)} max=${summaryLens[summaryLens.length - 1]}`)
-  console.log(`折叠(>400 字) ${pct(folded)}｜含要点 ${pct(withBullets)}｜摘要为空 ${pct(emptySummary)}`)
+  console.log(`含折叠面板 ${withPanel} 条（正常路径必须为 0）｜含要点 ${pct(withBullets)}｜摘要为空 ${pct(emptySummary)}`)
   console.log(`卡片 2.0 平均 ${(totalBytes / N / 1024).toFixed(1)}KB｜超 24KB 安全线 ${overBudget} 条`)
   console.log()
 
@@ -238,7 +241,9 @@ async function compare() {
             model,
             messages: [
               { role: 'system', content: SYSTEM_PROMPT },
-              { role: 'user', content: summarizeForLlm(r.text) },
+              // 与线上一致的三段式输入；回测语料没有配对提问/历史，故 question 为空、
+              // 历史为 (none)——这正是「提问缺失」的降级形态。
+              { role: 'user', content: buildFormatterInput({ question: '', reply: r.text }).text },
             ],
             max_tokens: 400,
             temperature: 0,
@@ -247,7 +252,7 @@ async function compare() {
         const json = await res.json()
         const raw = json?.choices?.[0]?.message?.content ?? ''
         const parsed = parseDigestJson(raw)
-        const verdict = parsed ? validateDigest(parsed, r.text) : { ok: false, reason: 'unparsable-output' }
+        const verdict = parsed ? validateDigest(parsed, r.text, '') : { ok: false, reason: 'unparsable-output' }
         lats.push(Date.now() - t0)
         if (verdict.ok) { valid++; llmLine = verdict.digest.summary }
         else { invalid++; llmLine = `✗ ${verdict.reason} → 回退兜底` }
