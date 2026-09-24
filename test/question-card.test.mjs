@@ -188,10 +188,37 @@ test('标题带题号，摘要进 config.summary.content（聊天列表预览用
   assert.equal(answered.header.title.content, 'DSH 提问 · 已选择')
 })
 
-test('按钮文本超长会截断，避免超出按钮可容纳字符数', () => {
-  const long = '选' + 'x'.repeat(120)
+test('长选项：完整文本进 markdown 正文，按钮退化成「选择 N」（按钮是单行，放不下全文）', () => {
+  // 用户报障：选项太长时按钮把它截成「…」，看不到完整内容就没法选。
+  // 修复：长选项的**完整原文**交给 markdown 正文（可换行），按钮只留序号。
+  const long = '这个选项的说明非常长，长到按钮一行绝对显示不下，需要完整读一遍才能判断要不要选它'
   const c = card({ question: { ...QUESTION, options: [{ label: long }, { label: '不带' }] } })
+
+  const texts = byTag(c, 'markdown').map((m) => m.content)
+  assert.ok(texts.some((t) => t.includes(long)), '完整选项文本必须逐字出现在正文里（不截断）')
+
   const buttons = byTag(c, 'button').filter((b) => b.behaviors?.[0]?.value?.kind === 'answer')
-  assert.ok(buttons[0].text.content.length <= 60)
-  assert.ok(buttons[0].text.content.endsWith('…'))
+  assert.equal(buttons[0].text.content, '选择 1', '长选项的按钮退化成序号')
+  assert.equal(buttons[1].text.content, '不带', '短选项仍然内联在按钮上，不退化')
+  // 回传给后端的必须仍是**原始 label**，不是展示用的短标签
+  assert.equal(buttons[0].behaviors[0].value.option, long)
+
+  // 仍然守住按钮文本容量（官方上限 100，内联路径自带 60 的截断）
+  for (const b of buttons) assert.ok(b.text.content.length <= 60, '按钮文本不得超容量')
+})
+
+test('短选项不退化：仍内联在按钮上，一键直点', () => {
+  const c = card()
+  const buttons = byTag(c, 'button').filter((b) => b.behaviors?.[0]?.value?.kind === 'answer')
+  assert.deepEqual(buttons.map((b) => b.text.content), ['带上测试环境', '不带'])
+})
+
+test('已答态显示完整所选文本，不再按按钮上限截断', () => {
+  const long = '这个选项的说明非常长，长到按钮一行绝对显示不下，需要完整读一遍才能判断要不要选它'
+  const c = card({
+    question: { ...QUESTION, options: [{ label: long }] },
+    state: 'answered', chosenIndex: 0,
+  })
+  const texts = byTag(c, 'markdown').map((m) => m.content)
+  assert.ok(texts.some((t) => t.includes('已选择：' + long)), '「我刚选了什么」必须完整可读')
 })
