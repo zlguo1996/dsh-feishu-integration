@@ -91,7 +91,7 @@ $DSH_HOME/cordis.patch.yml
       enabled: true                 # false = 完全关闭 LLM，只用确定性兜底
       provider: raven-cc            # 省略则继承 agent 默认模型的 provider
       model: deepseek-flash-latest  # 省略则继承 agent 默认模型的 model
-      timeoutMs: 1500               # 硬 deadline，200–2000；超时即回退，绝不阻塞通知
+      timeoutMs: 1500               # 硬 deadline，200–10000；超时即回退，绝不阻塞通知
       maxTokens: 400
 ```
 
@@ -262,7 +262,7 @@ The outbound summary is produced by a constrained **send-side LLM call** — it 
       enabled: true                 # false disables the LLM entirely (deterministic digest only)
       provider: raven-cc            # omit to inherit the agent default model's provider
       model: deepseek-flash-latest  # omit to inherit the agent default model's model
-      timeoutMs: 1500               # hard deadline, 200–2000; on timeout it falls back, never blocks
+      timeoutMs: 1500               # hard deadline, 200–10000; on timeout it falls back, never blocks
       maxTokens: 400
 ```
 
