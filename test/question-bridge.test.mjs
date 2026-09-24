@@ -166,6 +166,77 @@ test('replayed frames dedupe by rpcId; resolved cleans up and notifies non-us an
   bridge.close()
 })
 
+test('宿主接缝在 respond 内同步注入 resolved 时，我方作答不得被误报成「网页端先答」', async () => {
+  // 回归：2026-09-24 线上报障。host-question-seam 的 respond 实现是
+  // `__injectFrame(question/resolved)` → 再 resolve waterfall，也就是**同步**注入，
+  // 而不是像 mux 那样稍后异步回帧。若 applyParsedAnswer 在 respond 返回之后才置
+  // answeredByUs，handleResolved 读到的就是 false，于是往线程补一条
+  // 「ℹ️ 该问题已在 DSH 网页端被回答，会话继续执行中。」——
+  // 用户明明是自己点的卡片作答，却被提示"网页端答过了"。
+  const mux = makeFakeMux()
+  const posts = []
+  const { bridge } = makeBridge(mux, posts)
+
+  bridge.__setRespondForTest(async (message) => {
+    bridge.__injectFrame({
+      payload: {
+        type: 'question/resolved',
+        sessionId: 'session-fixed',
+        questionRpcId: message.rpcId,
+        outcome: message?.result?.ok ? 'answered' : 'cancelled',
+        answer: message?.result?.ok ? (message.result.value?.answer ?? null) : null,
+      },
+    })
+    mux.state.responds.push(message)
+    return { accepted: true }
+  })
+
+  mux.state.sockets[0].deliver('rq_sync', {
+    type: 'question/requested', sessionId: 'session-fixed', questions: [QUESTION],
+  })
+  await until(() => posts.length === 1, 'relayed post')
+
+  // 走真实入口：卡片按钮回传
+  const res = await bridge.handleCardAction({
+    rpcId: 'rq_sync', questionId: 'qq1', kind: 'answer', option: '裸机', optionIndex: 1,
+    messageId: 'card_msg_1',
+  })
+  assert.equal(res.toast.type, 'success')
+  await until(() => mux.state.responds.length === 1, 'answer submitted')
+  await new Promise((r) => setTimeout(r, 30))
+
+  assert.ok(
+    !posts.some((p) => /网页端被回答|网页端处理|已被取消/.test(p.text)),
+    '我方作答不得被误报成网页端抢答/已取消；实际帖子：' + JSON.stringify(posts.map((p) => p.text)),
+  )
+  assert.deepEqual(mux.state.responds[0].result.value.answer, {
+    answers: [{ id: 'qq1', selected: ['裸机'] }],
+  })
+  assert.equal(bridge.__pendingCount(), 0)
+  bridge.close()
+})
+
+test('网页端真抢答时仍补说明（修「误报」不能把这条分支也修没）', async () => {
+  const mux = makeFakeMux()
+  const posts = []
+  const { bridge } = makeBridge(mux, posts)
+
+  mux.state.sockets[0].deliver('rq_web', {
+    type: 'question/requested', sessionId: 'session-fixed', questions: [QUESTION],
+  })
+  await until(() => posts.length === 1, 'relayed post')
+
+  // 宿主接缝 fromWeb 分支的注入形状：我方从未置位 answeredByUs
+  bridge.__injectFrame({
+    payload: {
+      type: 'question/resolved', sessionId: 'session-fixed', questionRpcId: 'rq_web',
+      outcome: 'answered', answer: { answers: [{ id: 'qq1', selected: ['裸机'] }] },
+    },
+  })
+  await until(() => posts.some((p) => p.text.includes('网页端被回答')), 'web-win note')
+  bridge.close()
+})
+
 test('multi-question batch runs as sequential rounds then submits once', async () => {
   const mux = makeFakeMux()
   const posts = []
