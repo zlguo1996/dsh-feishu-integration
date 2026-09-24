@@ -1,6 +1,10 @@
 /**
- * 入站链路顺序回归：路由解析 → 即时回执 → OnIt reaction → session.prompt
- * → 最终回复；回执发送失败不得阻断后续流程。
+ * 入站链路顺序回归：路由解析 → OnIt reaction → session.prompt → 最终回复。
+ *
+ * 2026-09-24 变更：**去掉了「✅ 已转发到对应 DSH 会话」那条即时回执**。
+ * 理由：`OnIt` 表情本身已经表达「收到、正在处理」，再补一条消息只是刷屏（用户要求）。
+ * 因此本文件的断言从「回执先于 prompt」改为「reaction 先于 prompt，且回合结束前飞书侧没有文字消息」。
+ * 另注：回执原先也是「可长按引用」的锚点，但入站消息与最终回答都仍写 reply-map，引用续聊不受影响。
  *
  * 用假 Lark SDK + 本地 RPC 桩服务走真实 startInboundForBot 代码路径。
  */
@@ -18,7 +22,6 @@ function makeFakeLark(log, { failReply = false } = {}) {
 
   class EventDispatcher {
     register(handlers) {
-      // 直接挂到实例上，方便测试触发（真实 SDK 内部私有存储）
       Object.assign(this, handlers)
       return this
     }
@@ -58,11 +61,7 @@ function makeFakeLark(log, { failReply = false } = {}) {
     close() { log.push('ws-close') }
   }
 
-  return {
-    Domain, LoggerLevel, EventDispatcher, WSClient, Client,
-    /** 测试取回 dispatcher：start 后由包装的 WSClient 填充。 */
-    __dispatchers: [],
-  }
+  return { Domain, LoggerLevel, EventDispatcher, WSClient, Client }
 }
 
 function makeFakeLarkWithCapture(log, opts) {
@@ -72,10 +71,10 @@ function makeFakeLarkWithCapture(log, opts) {
     sdk.__dispatchers.push(opts2.eventDispatcher)
     return origStart.call(this, opts2)
   }
+  sdk.__dispatchers = []
   return sdk
 }
 
-/** 最小 DSH RPC 桩：session.list / session.history / session.prompt。 */
 function listen(server) {
   return new Promise((resolve) => server.once('listening', resolve))
 }
@@ -98,7 +97,7 @@ function makeRpcServer(state) {
       }
       if (method === 'session.prompt') {
         state.prompted = true
-        state.promptRpcId = rpcId // 请求体顶层的 rpcId
+        state.promptRpcId = rpcId
         state.promptText = payload.content?.[0]?.text
         return ok({})
       }
@@ -148,165 +147,113 @@ function makeHelpers(mappings) {
 
 const BOT = { id: 'bot_x', appId: 'cli_a', secretRef: 'ref', botName: '测试机器人' }
 
-test('inbound flow acknowledges routing before prompting and replies after turn end', async () => {
+/** 统一的启动+触发+收尾，保证任何断言失败都会关掉桩服务（否则 node --test 不会退出）。 */
+async function driveFixture({ log, mappings, state, larkOpts, run, replyTimeoutMs = 4000, failReply = false }) {
+  const server = makeRpcServer(state)
+  await listen(server.listen(0, '127.0.0.1'))
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const larkSdk = makeFakeLarkWithCapture(log, { failReply, ...larkOpts })
+  try {
+    await startInboundForBot({
+      origin,
+      workspace: '/tmp/proj-w',
+      agentPreset: 'standard',
+      replyTimeoutMs,
+      replyMaxChars: 9000,
+      defaultSessionPolicy: 'fixed',
+      bot: BOT,
+      appSecret: 's3cret',
+      record: null,
+      larkSdk,
+      helpers: makeHelpers(mappings),
+    })
+    const dispatcher = larkSdk.__dispatchers[0]
+    assert.ok(dispatcher, 'dispatcher captured')
+    dispatcher['im.message.receive_v1'](makeEvent('帮我看看'))
+    await run(dispatcher)
+  } finally {
+    await closeServer(server)
+  }
+}
+
+test('reaction 先于 prompt；回合结束前飞书侧没有文字消息，结束后回帖最终答案', async () => {
   const log = []
   const mappings = []
   const state = { prompted: false, promptRpcId: null, promptText: null, historyEvents: [] }
 
-  const server = makeRpcServer(state)
-  await listen(server.listen(0, '127.0.0.1'))
-  const origin = `http://127.0.0.1:${server.address().port}`
+  await driveFixture({
+    log, mappings, state,
+    run: async () => {
+      // 1. 第一条飞书写操作必须是 OnIt 表情（回执已去掉）
+      await until(() => log.some((e) => e?.op === 'reaction' && e.emoji === 'OnIt'), 'OnIt reaction')
+      assert.equal(log.filter((e) => e?.op === 'reply').length, 0, 'prompt 之前不得有任何回帖')
 
-  const larkSdk = makeFakeLarkWithCapture(log)
-  await startInboundForBot({
-    origin,
-    workspace: '/tmp/proj-w',
-    agentPreset: 'standard',
-    replyTimeoutMs: 4000,
-    replyMaxChars: 9000,
-    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
-    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
-    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
-    defaultSessionPolicy: 'fixed',
-    bot: BOT,
-    appSecret: 's3cret',
-    record: null,
-    larkSdk,
-    helpers: makeHelpers(mappings),
+      // 2. prompt 注入的是用户文本，rpcId 带 fsum- 前缀（防回环依据）
+      await until(() => state.prompted, 'prompt issued')
+      assert.equal(state.promptText, '帮我看看')
+      assert.match(state.promptRpcId, /^fsum-/)
+      assert.equal(log.filter((e) => e?.op === 'reply').length, 0, '回合进行中也不发文字消息')
+
+      // 3. 会话产生回答后：DONE reaction + 回帖到同一线程
+      state.historyEvents = [
+        { event: { seq: 10, type: 'turn/start', data: { turn: 7 } } },
+        { event: { seq: 11, type: 'user/message', data: { source: { rpcId: state.promptRpcId }, turn: 7 } } },
+        { event: { seq: 12, type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: '最终回答' }] } } } },
+        { event: { seq: 13, type: 'turn/end', data: { turn: 7 } } },
+      ]
+      await until(() => log.some((e) => e?.op === 'reply'), 'final reply')
+      const final = log.find((e) => e?.op === 'reply')
+      assert.equal(final.to, 'om_in_1')
+      assert.equal(final.text, '最终回答')
+      assert.ok(log.some((e) => e?.op === 'reaction' && e.emoji === 'DONE'), 'DONE reaction added')
+
+      // 4. 入站消息与最终回帖都映射到同一 session（连续线程路由依据；
+      //    回执没了，但入站消息本身仍是可引用锚点）
+      const mappedIds = new Set(mappings.map((m) => m.messageId))
+      for (const id of ['om_in_1', final.id]) {
+        assert.ok(mappedIds.has(id), `mapping recorded for ${id}`)
+      }
+      assert.ok(mappings.every((m) => m.sessionId === 'session-fixed'))
+    },
   })
-
-  const dispatcher = larkSdk.__dispatchers[0]
-  assert.ok(dispatcher, 'dispatcher captured')
-
-  // 触发入站事件（accept 同步调度，handle 异步执行）
-  dispatcher['im.message.receive_v1'](makeEvent('帮我看看'))
-
-  // 1. 即时回执先于其他飞书写操作
-  await until(() => log.some((e) => e?.op === 'reply'), 'ack reply')
-  const ack = log.find((e) => e?.op === 'reply')
-  assert.match(ack.text, /已转发到对应 DSH 会话/)
-  assert.match(ack.text, /空间：\/tmp\/proj-w/)
-  assert.match(ack.text, /会话：测试会话（session-fixed）/)
-
-  // 2. OnIt reaction 在回执之后、prompt 之前
-  await until(() => state.prompted, 'prompt issued')
-  const ackIdx = log.indexOf(ack)
-  const onItIdx = log.findIndex((e) => e?.op === 'reaction' && e.emoji === 'OnIt')
-  assert.ok(onItIdx > ackIdx, 'OnIt reaction comes after the acknowledgement')
-
-  // 3. prompt 注入的是用户文本，rpcId 带 fsum- 前缀（防回环依据）
-  assert.equal(state.promptText, '帮我看看')
-  assert.match(state.promptRpcId, /^fsum-/)
-
-  // 4. 会话产生回答后：DONE reaction + 最终回复到同一线程
-  state.historyEvents = [
-    { event: { seq: 10, type: 'turn/start', data: { turn: 7 } } },
-    { event: { seq: 11, type: 'user/message', data: { source: { rpcId: state.promptRpcId }, turn: 7 } } },
-    { event: { seq: 12, type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: '最终回答' }] } } } },
-    { event: { seq: 13, type: 'turn/end', data: { turn: 7 } } },
-  ]
-  await until(() => log.filter((e) => e?.op === 'reply').length >= 2, 'final reply')
-  const final = log.filter((e) => e?.op === 'reply')[1]
-  assert.equal(final.to, 'om_in_1')
-  assert.equal(final.text, '最终回答')
-  assert.ok(log.some((e) => e?.op === 'reaction' && e.emoji === 'DONE'), 'DONE reaction added')
-
-  // 5. 入站消息与两条回帖都映射到同一 session（连续线程路由依据）
-  const mappedIds = new Set(mappings.map((m) => m.messageId))
-  for (const id of ['om_in_1', ack.id, final.id]) {
-    assert.ok(mappedIds.has(id), `mapping recorded for ${id}`)
-  }
-  assert.ok(mappings.every((m) => m.sessionId === 'session-fixed'))
-
-  await closeServer(server)
 })
 
-test('acknowledgement failure does not block reaction or prompt flow', async () => {
+test('回帖失败不影响会话推进（reaction 状态照常收尾）', async () => {
   const log = []
   const state = { prompted: false, promptRpcId: null, promptText: null, historyEvents: [] }
-  const larkSdk = makeFakeLarkWithCapture(log, { failReply: true })
 
-  const server = makeRpcServer(state)
-  await listen(server.listen(0, '127.0.0.1'))
-  const origin = `http://127.0.0.1:${server.address().port}`
-
-  await startInboundForBot({
-    origin,
-    workspace: '/tmp/proj-w',
-    agentPreset: 'standard',
-    replyTimeoutMs: 1200,
-    replyMaxChars: 9000,
-    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
-    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
-    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
-    defaultSessionPolicy: 'fixed',
-    bot: BOT,
-    appSecret: 's3cret',
-    record: null,
-    larkSdk,
-    helpers: makeHelpers([]),
+  await driveFixture({
+    log, mappings: [], state, failReply: true, replyTimeoutMs: 1200,
+    run: async () => {
+      // 回帖全失败，但仍应走到 prompt、并加上 OnIt
+      await until(() => state.prompted, 'prompt despite reply failure')
+      assert.ok(log.some((e) => e?.op === 'reaction' && e.emoji === 'OnIt'), 'OnIt reaction still added')
+      assert.equal(state.promptText, '帮我看看')
+    },
   })
-
-  const dispatcher = larkSdk.__dispatchers[0]
-  dispatcher['im.message.receive_v1'](makeEvent('帮我看看'))
-
-  // 回执失败后仍应继续：OnIt reaction 与 prompt 都发生
-  await until(() => state.prompted, 'prompt despite ack failure')
-  assert.ok(
-    log.some((e) => e?.op === 'reaction' && e.emoji === 'OnIt'),
-    'OnIt reaction still added after ack failure',
-  )
-  assert.equal(state.promptText, '帮我看看')
-
-  await closeServer(server)
 })
 
-test('ask timeout stays silent in Feishu — the routing ack already served as the reply', async () => {
+test('等待回答超时时飞书侧完全静默：只有 OnIt 表情，没有文字消息、没有 ERROR 表情', async () => {
   const log = []
   const state = { prompted: false, promptRpcId: null, promptText: null, historyEvents: [] }
-  const larkSdk = makeFakeLarkWithCapture(log)
 
-  // 历史永远不产生 turn/end → ask() 必然超时
-  const server = makeRpcServer(state)
-  await listen(server.listen(0, '127.0.0.1'))
-  const origin = `http://127.0.0.1:${server.address().port}`
+  await driveFixture({
+    log, mappings: [], state, replyTimeoutMs: 600,
+    run: async () => {
+      await until(() => state.prompted, 'prompt issued')
+      // 等 ask() 轮询超时并走完 handle() 的 catch（600ms 超时 + 轮询间隔余量）
+      await new Promise((r) => setTimeout(r, 1800))
 
-  await startInboundForBot({
-    origin,
-    workspace: '/tmp/proj-w',
-    agentPreset: 'standard',
-    replyTimeoutMs: 600,
-    replyMaxChars: 9000,
-    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
-    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
-    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
-    defaultSessionPolicy: 'fixed',
-    bot: BOT,
-    appSecret: 's3cret',
-    record: null,
-    larkSdk,
-    helpers: makeHelpers([]),
+      // 去掉转发回执后：超时情况下飞书侧一条文字消息都没有
+      assert.equal(log.filter((e) => e?.op === 'reply').length, 0, 'no text message at all')
+      assert.ok(
+        log.some((e) => e?.op === 'reaction' && e.emoji === 'OnIt'),
+        'OnIt reaction kept as the only signal',
+      )
+      assert.ok(
+        !log.some((e) => e?.op === 'reaction' && e.emoji === 'ERROR'),
+        'no ERROR reaction on timeout',
+      )
+    },
   })
-
-  const dispatcher = larkSdk.__dispatchers[0]
-  dispatcher['im.message.receive_v1'](makeEvent('帮我看看'))
-
-  await until(() => state.prompted, 'prompt issued')
-  // 等待 ask() 轮询超时并走完 handle() 的 catch（600ms 超时 + 轮询间隔余量）
-  await new Promise((r) => setTimeout(r, 1800))
-
-  // 飞书侧只有一条回帖：路由回执本身；没有任何失败反馈
-  const replies = log.filter((e) => e?.op === 'reply')
-  assert.equal(replies.length, 1, 'only the routing acknowledgement is posted')
-  assert.match(replies[0].text, /已转发到对应 DSH 会话/)
-  assert.ok(
-    !log.some((e) => e?.op === 'reaction' && e.emoji === 'ERROR'),
-    'no ERROR reaction on timeout',
-  )
-  assert.ok(
-    log.some((e) => e?.op === 'reaction' && e.emoji === 'OnIt'),
-    'OnIt reaction kept as-is',
-  )
-
-  await closeServer(server)
 })

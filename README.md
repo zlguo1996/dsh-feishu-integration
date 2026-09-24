@@ -167,15 +167,17 @@ $DSH_HOME/integrations/dsh-feishu/bots/<bot-id>/state.json
 3. 插件记录 `message_id → sessionId` 映射；
 4. 用户在飞书中回复该总结；
 5. 插件根据 `parent_id/root_id` 查找映射；
-6. 命中后先立即在原飞书线程回复“已转发到哪个空间、哪个 DSH 会话”，其中包含 workspace 路径、会话标题和 session ID；
-7. 再以 queue 模式把文本注入对应 DSH session；
+6. 命中后给这条入站消息加一个 `OnIt` 表情，表示「已收到、正在处理」；
+7. 以 queue 模式把文本注入对应 DSH session；
 8. 最终回答回帖到原飞书线程。
 
-即时回执的 `message_id` 也会写入同一个 `sessionId` 映射，因此用户继续回复这条确认消息时，仍会回到同一个 DSH 会话。
+不再另发「已转发到对应 DSH 会话」的文字回执：`OnIt` 表情已经表达「已收到」，再补一条消息只是刷屏（2026-09-24 用户要求去掉）。需要知道「这一轮进了哪个会话」时看 host 日志里的那行 `[路由]/[默认·延续]/[默认·新建] <messageId> → <sessionId>`。
+
+入站消息本身与最终回答都会写入同一个 `sessionId` 映射，因此用户继续回复或长按引用其中任一条时，仍会回到同一个 DSH 会话——去掉文字回执不影响「引用续聊」的能力。
 
 **发送重试**：总结直发内置有界重试——最多 10 次尝试，指数退避（1s 起、30s 封顶、±20% 抖动）；重试等待期间用 DNS 探测 `open.feishu.cn` 做可达性门控，断网时顺延等待（不消耗尝试次数），总截止 10 分钟。每次逻辑发送携带飞书消息幂等 `uuid`，「已送达但响应丢失」不会重复投递。重试全部放弃时写入死信 `~/.dsh/integrations/dsh-feishu/pending-summaries.jsonl` 供排查（不自动补发）。
 
-等待回答超时（默认 600s）时插件保持静默：不追发「处理失败」回帖、不追加错误表情——转发回执本身已被视为送达确认，超时仅记录在 host 日志中。其他真实错误仍会回帖提示。
+等待回答超时（默认 600s）时插件保持静默：不追发「处理失败」回帖、不追加错误表情——此时飞书侧只剩那个 `OnIt` 表情（刻意如此，避免用错误文案刷屏），超时仅记录在 host 日志中。其他真实错误仍会回帖提示。
 
 由飞书回复触发的 DSH 回合带有 `fsum-` RPC 标记，不会再次生成总结，从而避免回环。
 
@@ -216,7 +218,7 @@ lib/shared/         纯函数与常量（findReplyMapping 等测试缝）
 client-src/         浏览器设置页源码（api / styles / index）
 lib/client.js       由 client-src 构建生成的浏览器 bundle（勿手改）
 scripts/            build-client.mjs：esbuild 打包出 ModuleLoader 包装产物
-test/               node:test 回归（路由映射 / 回执文案 / 入站顺序）
+test/               node:test 回归（路由映射 / 入站顺序 / 提问卡片）
 ```
 
 约束：一个 bot 只允许一个飞书长连接（集群模式多 client 会随机分流事件）；
