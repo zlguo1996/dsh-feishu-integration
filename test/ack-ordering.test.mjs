@@ -164,6 +164,10 @@ test('inbound flow acknowledges routing before prompting and replies after turn 
     agentPreset: 'standard',
     replyTimeoutMs: 4000,
     replyMaxChars: 9000,
+    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
+    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
+    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
+    defaultSessionPolicy: 'fixed',
     bot: BOT,
     appSecret: 's3cret',
     record: null,
@@ -232,6 +236,10 @@ test('acknowledgement failure does not block reaction or prompt flow', async () 
     agentPreset: 'standard',
     replyTimeoutMs: 1200,
     replyMaxChars: 9000,
+    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
+    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
+    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
+    defaultSessionPolicy: 'fixed',
     bot: BOT,
     appSecret: 's3cret',
     record: null,
@@ -269,6 +277,10 @@ test('ask timeout stays silent in Feishu — the routing ack already served as t
     agentPreset: 'standard',
     replyTimeoutMs: 600,
     replyMaxChars: 9000,
+    // 本文件只关心「回执→reaction→prompt→回帖」的顺序，以及回执失败不阻断流程，
+    // 所以显式钉住旧行为（复用已存在的固定会话）。默认的 'fresh' 会在每条消息上
+    // 新建会话，那个策略的语义与边界由 test/session-policy.test.mjs 专门覆盖。
+    defaultSessionPolicy: 'fixed',
     bot: BOT,
     appSecret: 's3cret',
     record: null,

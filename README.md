@@ -97,7 +97,16 @@ $DSH_HOME/cordis.patch.yml
 
 给通知单独指定一个更快/更便宜的模型就填 `provider` + `model`；想跟随日常用的模型就整块省略。两者必须**同时**给出才生效——只给一个会被忽略并回落到 agent 默认模型。
 
-排障：摘要走兜底时宿主日志会打 `[formatter] agent 默认模型未给出 provider/model，回退确定性兜底`（warn 级），以及 `[总结] 摘要走确定性兜底: <reason>`（info 级）。若两条都拿不到模型，说明当前 profile 里既没有显式配置、agent 默认模型也未解析出来。
+排障：摘要走兜底时宿主日志会打 warn 级记录，`reason` 直接指出断点：
+
+- `no-model-route` — agent 默认模型没解析出 provider/model（既没显式配置，也读不到 agent 默认模型）；
+- `llm-unavailable` — 这个组合里根本没有 `llm` 服务；
+- `stream-error(<code> / HTTP <status> / <provider 原文>)` — 请求发出去了但 provider 报错（路由指向的本地代理没起、凭据失效等）；
+- `empty-output(chunks=…,finish=…)` — 流正常结束但一个 text-delta 都没有；
+- `unparsable-output` — 有输出但不是契约要求的 JSON；
+- `source-coverage` / `summary-too-long` 等 — 输出违反契约（例如引入了原文没有的数字）。
+
+另有 `[总结] 摘要走确定性兜底: <reason>` 一行汇总。这些以前是 info 级、**磁盘上什么都看不到**，现在统一提到 warn。
 
 ## CLI 管理
 
@@ -125,6 +134,31 @@ $DSH_HOME/integrations/dsh-feishu/bots/<bot-id>/state.json
 ```
 
 敏感的 `app_secret` 使用 DSH credential store，不写入公开配置文件。
+
+## 默认会话策略（不引用会话时落在哪个会话）
+
+`takeoverInbound=true` 时，入站消息先按 `parent_id/root_id` 查 reply-map，**命中就进命中的会话**。没命中时，按 `defaultSessionPolicy` 决定落到哪里：
+
+| 值 | 行为 |
+|---|---|
+| `fresh`（默认） | **每条消息新建一个 DSH 会话**，不继承之前的任何上下文 |
+| `fixed` | 复用 `conversationKey`（p2p 按发送者、群聊按 chat_id）对应的固定会话，上下文持续累积 |
+| `idle` | 复用固定会话，但空闲超过 `defaultSessionIdleMinutes`（默认 30 分钟）就换一个新的 |
+
+为什么默认 `fresh`：固定会话的上下文**只增不减** —— 聊得越久，每轮喂给模型的 token 越多，
+最终要么撞上上下文上限、要么让后续回答开始失焦。每条消息开新会话能从根上避免这件事。
+
+**连续性靠「引用」，不靠固定会话**：出站总结卡与机器人的每条回答都会写 reply-map；
+在飞书里长按引用任意一条，即可回到它所属的会话继续上文。
+
+```yaml
+- id: dsh-feishu-integration
+  config:
+    defaultSessionPolicy: fresh   # fresh | fixed | idle
+    defaultSessionIdleMinutes: 30 # 仅 idle 生效
+```
+
+`/help` 会把当前生效的策略播报给用户。未知的策略名会被收敛为 `fresh`（而不是静默沿用固定会话）。
 
 ## 路由行为
 
