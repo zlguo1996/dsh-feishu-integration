@@ -165,8 +165,8 @@ async function drive({ texts, policy, idleMinutes, botState, replyTimeoutMs = 30
 
   const dispatcher = captured[0]
   texts.forEach((text, i) => dispatcher['im.message.receive_v1'](makeEvent(text, 'om_in_' + (i + 1))))
-  // 只数**入站**记账：每条入站除了 'feishu-inbound' 还会为回帖写 'feishu-outbound-reply'，
-  // 按 mappings.length 等会被第一条消息的回帖提前满足（测试竞态）。
+  // 只数**入站**记账：按 mappings.length 等会被非入站来源提前满足（测试竞态）。
+  // 571bc89 起入站路径不再回帖，本用例的记账本就只剩 feishu-inbound；保留过滤以表明意图。
   const inbound = () => bag.mappings.filter((m) => m.source === 'feishu-inbound')
   await until(() => inbound().length >= texts.length, `${texts.length} inbound mappings recorded`)
 
@@ -174,7 +174,7 @@ async function drive({ texts, policy, idleMinutes, botState, replyTimeoutMs = 30
   return { bag, state }
 }
 
-/** 只看**入站**记账：回帖/总结也会写 reply-map（source=feishu-outbound-reply）。 */
+/** 只看**入站**记账：出站总结/回帖由 summary-service 记账，不参与本文件的路由断言。 */
 const inboundOf = (bag) => bag.mappings.filter((m) => m.source === 'feishu-inbound')
 const sessionIdsOf = (bag) => inboundOf(bag).map((m) => m.sessionId)
 
@@ -191,11 +191,12 @@ test('fresh（默认）：不引用会话时每条消息各自新建会话，绝
   const ids = sessionIdsOf(bag)
   assert.equal(new Set(ids).size, 3, '三条消息落在三个不同会话')
   assert.ok(!ids.includes('session-fixed'), '未复用预置的固定会话')
-  // 回帖（feishu-outbound-reply）也记账，且必须落在同一个新建会话上 ——
-  // 这正是「引用机器人的回答就能继续那段上下文」的依据。
+  // 新契约（571bc89）：入站路径不再回帖、不再投递 —— 因此不会再有 feishu-outbound-reply
+  // 记账；「引用续聊」的锚点是入站消息本身（出站总结的锚点由 summary-service 记账）。
+  assert.ok(!bag.mappings.some((m) => m.source === 'feishu-outbound-reply'),
+    '入站路径不再回帖，不该有出站回帖记账')
   assert.ok(bag.mappings.every((m) => ids.includes(m.sessionId)),
-    '回帖记账也指向同一批新会话')
-  assert.ok(bag.mappings.some((m) => m.source === 'feishu-outbound-reply'))
+    '本用例里的记账（即入站锚点）都指向这批新会话')
 })
 
 test('fixed：保留旧行为，未引用会话时复用同一固定会话', async () => {

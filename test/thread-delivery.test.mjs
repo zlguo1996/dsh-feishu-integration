@@ -6,7 +6,9 @@
  * - 每个分段各用自己的幂等 uuid（独立 deliveryUuid + 序号），绝不复用根的 uuid；
  * - 每个分段都写 reply-map（嵌套回复也能路由回同一会话）；
  * - 根失败/无 message_id/分段失败：保留根、不重发根，落线程死信；
- * - 唯一允许折叠面板的路径是「线程能力不可用」。
+ * - 唯一允许折叠面板的路径是「线程能力不可用」；
+ * - 飞书发起的回合（rpcId 前缀 `fsum-`）与 Web 发起的一样由本监听投递，恰好一次 ——
+ *   去重靠「唯一投递方」（571bc89 删掉了 `fromFeishu` 闸门，入站路径不再投递）。
  */
 
 import test from 'node:test'
@@ -287,7 +289,7 @@ test('notificationFormat:text → 纯文本根 + 仍然建线程', () => withHar
   assert.equal(calls.reply[0].card.body.elements[0].content, REPLY)
 }, { deps: { notificationFormat: 'text' } }))
 
-test('飞书回复触发的回合绝不回发总结（防乒乓）', () => withHarness(async ({ calls, emit }) => {
+test('飞书发起的回合（fsum-）走同一条投递路径：事件监听恰好投递一次，去重靠唯一投递方', () => withHarness(async ({ calls, emit }) => {
   const events = [
     { type: 'turn/start', data: { turn: 1 } },
     { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: '来自飞书' }], source: { kind: 'user', rpcId: 'fsum-rpc-1' } } },
@@ -295,13 +297,16 @@ test('飞书回复触发的回合绝不回发总结（防乒乓）', () => withH
     { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
   ]
   const session = makeSession({ events })
-  emit(session, { type: 'turn/start', data: { turn: 1 } })
+  emit(session, events[0])
   emit(session, events[1])
   emit(session, TURN_END)
-  await sleep(50)
-  assert.equal(calls.card.length, 0)
+  await waitFor(() => calls.reply.length >= 1)
+  await sleep(20)
+  // 去重不再靠 `fromFeishu` 闸门 + 入站二选一，而是靠**唯一投递方**：入站路径已不再
+  // 投递（见 inbound-card-delivery 一），所以这里的一次 turn/end 只投递一次。
+  assert.equal(calls.card.length, 1)
   assert.equal(calls.text.length, 0)
-  assert.equal(calls.reply.length, 0)
+  assert.equal(calls.reply.length, 1, '完整回复进话题线程，同样只投一次')
 }))
 
 test('非 completed 的结束原因不发通知', () => withHarness(async ({ calls, emit }) => {
